@@ -28,6 +28,7 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4MoETextModelBackend,
     _build_packed_gemma4_causal_mask_mapping,
     _build_unpacked_gemma4_causal_mask_mapping,
+    _dense_hf_mm_token_type_ids,
     _derive_padding_mask,
 )
 from nemo_automodel.components.models.gemma4_moe.parallelization import _get_attention_head_counts
@@ -614,6 +615,73 @@ class TestPackedGemma4MaskMapping:
         )
         # Batches with vision tokens are unchanged: the overlay is still applied, so the mask stays explicit.
         assert with_image["full_attention"] is not None
+
+    def test_dense_hf_mm_token_type_ids_drops_all_text_ids(self, monkeypatch):
+        from transformers.models.gemma4 import modeling_gemma4
+
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", None, raising=False)
+        input_ids = torch.zeros(1, 6, dtype=torch.long)
+        with_image = torch.tensor([[0, 1, 1, 0, 0, 0]])
+
+        def normalize(ids):
+            """Normalize ``ids``, a tensor of shape [batch, sequence] or ``None``, for a training dense forward."""
+            return _dense_hf_mm_token_type_ids(ids, input_ids, vision_bidirectional=True, training=True)
+
+        assert normalize(torch.zeros(1, 6, dtype=torch.long)) is None
+        assert normalize(None) is None
+        assert normalize(with_image) is with_image
+
+    def test_dense_hf_mm_token_type_ids_defaults_for_legacy_mapping(self, monkeypatch):
+        from transformers.models.gemma4 import modeling_gemma4
+
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", MagicMock(), raising=False)
+        input_ids = torch.zeros(2, 5, dtype=torch.long)
+
+        default = _dense_hf_mm_token_type_ids(None, input_ids, vision_bidirectional=True, training=True)
+        assert torch.equal(default, torch.zeros(2, 5, dtype=torch.long))
+        assert _dense_hf_mm_token_type_ids(None, input_ids, vision_bidirectional=True, training=False) is None
+
+    def test_hf_text_masks_match_vision_builder_without_vision_tokens(self):
+        from transformers.masking_utils import create_masks_for_generate
+        from transformers.models.gemma4 import modeling_gemma4
+
+        config = _make_text_config(sliding_window=3)
+        config._attn_implementation = "sdpa"
+        mask_kwargs = dict(
+            config=config,
+            inputs_embeds=torch.zeros(2, 6, 8),
+            attention_mask=torch.tensor([[1, 1, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1]]),
+            past_key_values=None,
+            position_ids=None,
+        )
+
+        # Justifies dropping all-text mm_token_type_ids: HF's text path builds the same mask values.
+        vision = modeling_gemma4.create_masks_for_vision_model(**mask_kwargs, block_sequence_ids=torch.full((2, 6), -1))
+        text = create_masks_for_generate(**mask_kwargs)
+        for layer_type in ("full_attention", "sliding_attention"):
+            torch.testing.assert_close(text[layer_type], vision[layer_type])
+
+    def test_hf_text_path_leaves_sliding_window_to_ffpa_fa_backend(self, monkeypatch):
+        from transformers.masking_utils import create_masks_for_generate
+
+        from nemo_automodel.components.attention import ffpa_attention
+
+        monkeypatch.setattr(ffpa_attention, "HAS_FLASH_ATTN", True)
+        ffpa_attention.register_ffpa_attention()
+        config = _make_text_config(sliding_window=3, ffpa_sliding_attn_backend="fa")
+        config._attn_implementation = "ffpa"
+        padding = torch.tensor([[1, 1, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1]])
+        mask_kwargs = dict(
+            config=config, inputs_embeds=torch.zeros(2, 6, 8, dtype=torch.bfloat16), past_key_values=None
+        )
+
+        unpadded = create_masks_for_generate(**mask_kwargs, attention_mask=None, position_ids=None)
+        padded = create_masks_for_generate(**mask_kwargs, attention_mask=padding, position_ids=None)
+
+        # Transformers' real sliding-mask call is recognized as a plain window: padding layout, no BlockMask.
+        assert unpadded == {"full_attention": None, "sliding_attention": None}
+        assert torch.equal(padded["sliding_attention"], padding.bool())
+        assert torch.equal(padded["full_attention"], padding.bool())
 
 
 # ---------------------------------------------------------------------------
