@@ -341,7 +341,15 @@ def test_forward_dense_cp_embeds_from_ids_with_softcapping():
     assert out.logits.abs().max().item() <= 30.0 + 1e-3
 
 
-def test_forward_dense_train_vision_fills_mm_token_type_ids():
+@pytest.mark.parametrize("legacy_mask_mapping", [False, True], ids=["current_hf", "legacy_hf"])
+def test_forward_dense_train_vision_mm_token_type_ids_for_hf(monkeypatch, legacy_mask_mapping):
+    from transformers.models.gemma4 import modeling_gemma4
+
+    # Legacy create_causal_mask_mapping requires mm_token_type_ids when training; current HF does not, and
+    # all-text ids would only push it onto the vision mask builder.
+    monkeypatch.setattr(
+        modeling_gemma4, "create_causal_mask_mapping", mock.MagicMock() if legacy_mask_mapping else None, raising=False
+    )
     cfg = _cfg(enable_moe_block=False, use_bidirectional_attention="vision")
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
     model.train()
@@ -357,8 +365,10 @@ def test_forward_dense_train_vision_fills_mm_token_type_ids():
         side_effect=fake_super_forward,
     ):
         model(input_ids=torch.tensor([[1, 2, 3, 4]]))
-    assert captured["mm"] is not None  # zeros tensor was synthesized
-    assert torch.equal(captured["mm"], torch.zeros(1, 4, dtype=torch.long))
+    if legacy_mask_mapping:
+        assert torch.equal(captured["mm"], torch.zeros(1, 4, dtype=torch.long))
+    else:
+        assert captured["mm"] is None
 
 
 # ---------------------------------------------------------------------------

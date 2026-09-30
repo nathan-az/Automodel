@@ -15,8 +15,9 @@
 """FFPA attention bindings for HF ``ALL_ATTENTION_FUNCTIONS`` / ``ALL_MASK_ATTENTION_FUNCTIONS``.
 
 Routes ``head_dim=512`` bf16/fp16 layers through the CuTeDSL FFPA kernel,
-sliding-window (flex ``BlockMask``) layers through FlexAttention, and falls back
-to SDPA (or eager for softcap) for other unsupported configurations.
+sliding-window layers through FlexAttention (flex ``BlockMask``, default), SDPA,
+or FlashAttention-2 (``ffpa_sliding_attn_backend``), and falls back to SDPA (or
+eager for softcap) for other unsupported configurations.
 """
 
 from __future__ import annotations
@@ -27,12 +28,19 @@ from typing import TYPE_CHECKING, Any, Callable, cast
 import torch
 from torch import nn
 
+from nemo_automodel.shared.import_utils import safe_import_from
+
 if TYPE_CHECKING:
     from torch.nn.attention.flex_attention import BlockMask
 
 logger = logging.getLogger(__name__)
 
+HAS_FLASH_ATTN, _flash_attn_func = safe_import_from("flash_attn", "flash_attn_func")
+_, _flash_attn_varlen_func = safe_import_from("flash_attn", "flash_attn_varlen_func")
+
 _FFPA_HEAD_DIM = 512
+# FlashAttention-2 supports head dims up to 256.
+_FA_MAX_HEAD_DIM = 256
 _REGISTERED: bool = False
 _FALLBACK_WARNED: set[str] = set()
 
@@ -329,6 +337,31 @@ def _get_ffpa_high_level() -> tuple[Callable, Any] | None:
     return _FFPA_HIGH_LEVEL
 
 
+def _fa_owns_sliding_mask(
+    q_length: int, kv_length: int, q_offset: int, kv_offset: int, dtype: torch.dtype, mask_kwargs: dict[str, Any]
+) -> bool:
+    """Whether a non-causal mask is a plain causal sliding window that FlashAttention can apply itself.
+
+    Transformers passes ``local_size`` only for sliding-window masks and clears ``allow_is_causal_skip``
+    whenever it composes anything else onto the window (vision/blockwise overlays, packed sequences,
+    custom or/and mask functions, compiled decoding). Anything but a plain training-style window
+    (no offsets, square) keeps the Flex ``BlockMask``.
+    """
+    if mask_kwargs.get("local_size") is None or mask_kwargs.get("allow_is_causal_skip") is not True:
+        _warn_once("fa_composed_mask", "mask is not a plain causal sliding window (e.g. vision overlay)", target="flex")
+        return False
+    if q_offset != 0 or kv_offset != 0 or q_length != kv_length:
+        _warn_once("fa_offsets", "needs q_length == kv_length and no offsets (cache/decoding)", target="flex")
+        return False
+    if dtype not in (torch.float16, torch.bfloat16):
+        _warn_once("fa_dtype", f"FlashAttention needs bf16/fp16, got {dtype}", target="flex")
+        return False
+    if not HAS_FLASH_ATTN:
+        _warn_once("fa_unavailable", "flash_attn is not importable", target="flex")
+        return False
+    return True
+
+
 def ffpa_mask(
     batch_size: int,
     q_length: int,
@@ -358,7 +391,8 @@ def ffpa_mask(
         A boolean tensor of shape ``[batch, kv_sequence]`` in padding layout or
         ``[batch, 1, query_sequence, kv_sequence]`` in SDPA layout, a ``BlockMask`` for FlexAttention, or
         ``None`` when causal attention needs no explicit mask. A padding-layout result may alias
-        ``attention_mask``.
+        ``attention_mask``. With ``ffpa_sliding_attn_backend="fa"``, plain sliding-window masks also
+        return the padding layout (the window is applied by FlashAttention).
     """
     # Vision / audio sub-encoders share this registry but need 4D float masks.
     cfg = kwargs.get("config")
@@ -370,28 +404,34 @@ def ffpa_mask(
         from transformers.masking_utils import causal_mask_function, flex_attention_mask
 
         if mask_function is not causal_mask_function:
-            device = kwargs.pop("device", None) or (attention_mask.device if attention_mask is not None else "cpu")
             sliding_backend = str(getattr(cfg, "ffpa_sliding_attn_backend", "flex")).lower()
-            if sliding_backend == "sdpa":
-                from transformers.masking_utils import sdpa_mask
+            if sliding_backend not in ("flex", "sdpa", "fa"):
+                raise ValueError(f"ffpa_sliding_attn_backend must be 'flex', 'sdpa' or 'fa', got {sliding_backend!r}.")
+            # With "fa", FlashAttention applies causal + window itself, so a plain sliding mask
+            # reduces to the padding layout below and no BlockMask is built.
+            if not (
+                sliding_backend == "fa"
+                and _fa_owns_sliding_mask(q_length, kv_length, q_offset, kv_offset, dtype, kwargs)
+            ):
+                device = kwargs.pop("device", None) or (attention_mask.device if attention_mask is not None else "cpu")
+                if sliding_backend == "sdpa":
+                    from transformers.masking_utils import sdpa_mask
 
-                mask_builder = sdpa_mask
-            elif sliding_backend == "flex":
-                # BlockMask preserves sliding sparsity and selects the Flex path in ffpa_attention_forward.
-                mask_builder = flex_attention_mask
-            else:
-                raise ValueError(f"ffpa_sliding_attn_backend must be 'flex' or 'sdpa', got {sliding_backend!r}.")
-            return mask_builder(
-                batch_size=batch_size,
-                q_length=q_length,
-                kv_length=kv_length,
-                q_offset=q_offset,
-                kv_offset=kv_offset,
-                mask_function=mask_function,
-                attention_mask=attention_mask,
-                device=device,
-                **kwargs,
-            )
+                    mask_builder = sdpa_mask
+                else:
+                    # BlockMask preserves sliding sparsity and selects the Flex path in ffpa_attention_forward.
+                    mask_builder = flex_attention_mask
+                return mask_builder(
+                    batch_size=batch_size,
+                    q_length=q_length,
+                    kv_length=kv_length,
+                    q_offset=q_offset,
+                    kv_offset=kv_offset,
+                    mask_function=mask_function,
+                    attention_mask=attention_mask,
+                    device=device,
+                    **kwargs,
+                )
 
     if attention_mask is None:
         return None
@@ -400,6 +440,63 @@ def ffpa_mask(
     if attention_mask.shape[-1] != kv_length:
         attention_mask = attention_mask[:, -kv_length:]
     return None if bool(attention_mask.all()) else attention_mask
+
+
+def _fa_sliding_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    *,
+    dropout: float,
+    scaling: float | None,
+    softcap: float | None,
+) -> tuple[torch.Tensor, None]:
+    """Run a causal sliding-window layer through FlashAttention-2.
+
+    Args:
+        module: Attention module whose ``sliding_window`` (keys attended per query, itself included) sets the
+            window.
+        query: Tensor of shape [batch, query_heads, sequence, head_dim] in SDPA layout, bf16/fp16,
+            ``head_dim <= 256``.
+        key: Tensor of shape [batch, key_value_heads, sequence, head_dim] in SDPA layout.
+        value: Tensor of shape [batch, key_value_heads, sequence, head_dim] in SDPA layout.
+        attention_mask: ``None`` or a boolean padding tensor of shape [batch, sequence] (``True`` keeps the
+            token), as produced by ``ffpa_mask``.
+        dropout: Attention dropout probability.
+        scaling: Pre-softmax scale; ``None`` uses FlashAttention's ``1/sqrt(head_dim)``.
+        softcap: Optional score cap.
+
+    Returns:
+        A tuple of the output tensor of shape [batch, sequence, query_heads, head_dim] (zero on padded query
+        rows) and ``None``.
+    """
+    if query.dtype not in (torch.float16, torch.bfloat16) or query.shape[-1] > _FA_MAX_HEAD_DIM:
+        raise RuntimeError(
+            f"ffpa_sliding_attn_backend='fa' needs bf16/fp16 and head_dim <= {_FA_MAX_HEAD_DIM}, got "
+            f"{query.dtype} / head_dim={query.shape[-1]}; use 'flex' for this model."
+        )
+    fa_kwargs = dict(
+        dropout_p=float(dropout),
+        softmax_scale=scaling,
+        causal=True,
+        # HF sliding_window=W keeps keys with kv_idx > q_idx - W, i.e. W - 1 keys to the left.
+        window_size=(int(module.sliding_window) - 1, 0),
+        softcap=float(softcap) if softcap is not None else 0.0,
+    )
+    q, k, v = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+    if attention_mask is None:
+        return _flash_attn_func(q, k, v, **fa_kwargs), None
+
+    from transformers.modeling_flash_attention_utils import _pad_input, _unpad_input, _upad_input
+
+    B, S = q.shape[:2]
+    q_pack, k_pack, v_pack, indices_q, (cu_q, cu_k), (max_q, max_k) = _upad_input(
+        q, k, v, attention_mask, S, _unpad_input
+    )
+    out_pack = _flash_attn_varlen_func(q_pack, k_pack, v_pack, cu_q, cu_k, max_q, max_k, **fa_kwargs)
+    return _pad_input(out_pack, indices_q, B, S), None
 
 
 def ffpa_attention_forward(
@@ -423,7 +520,8 @@ def ffpa_attention_forward(
             QKV share dtype and device. FFPA requires float16 or bfloat16 CUDA tensors with head dimension 512.
         attention_mask: Optional boolean padding tensor of shape [batch, key_value_sequence] or additive tensor
             of shape [batch, 1, query_sequence, key_value_sequence]. A Flex ``BlockMask`` produced by
-            ``ffpa_mask`` may also be supplied for the FlexAttention route.
+            ``ffpa_mask`` may also be supplied for the FlexAttention route. For sliding-window layers with
+            ``ffpa_sliding_attn_backend="fa"``, ``None`` or a padding tensor selects the FlashAttention route.
         dropout: Dropout probability. Nonzero training dropout makes the FFPA route ineligible.
         scaling: Optional pre-softmax scaling factor applied to query-key scores.
         softcap: Optional score cap; when present, the eager fallback owns execution.
@@ -440,6 +538,17 @@ def ffpa_attention_forward(
         if flex is None:
             raise RuntimeError("ffpa_attention_forward: flex_attention is unavailable for sliding-window layers")
         return flex(module, query, key, value, attention_mask, scaling=scaling, softcap=softcap, **kwargs)
+
+    # ffpa_mask left this sliding layer's causal + window to FlashAttention (padding layout or no mask).
+    sliding_backend = str(getattr(getattr(module, "config", None), "ffpa_sliding_attn_backend", "flex")).lower()
+    if (
+        getattr(module, "sliding_window", None) is not None
+        and sliding_backend == "fa"
+        and (attention_mask is None or (attention_mask.dim() == 2 and attention_mask.dtype == torch.bool))
+    ):
+        return _fa_sliding_attention_forward(
+            module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, softcap=softcap
+        )
 
     def _fallback():
         if softcap is None:

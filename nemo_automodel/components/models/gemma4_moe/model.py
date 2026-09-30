@@ -491,6 +491,44 @@ def get_block_sequence_ids_for_mask(mm_token_type_ids: torch.Tensor, device: tor
     return block_sequence_ids
 
 
+def _dense_hf_mm_token_type_ids(
+    mm_token_type_ids: torch.Tensor | None,
+    reference: torch.Tensor,
+    *,
+    vision_bidirectional: bool,
+    training: bool,
+) -> torch.Tensor | None:
+    """Normalize ``mm_token_type_ids`` before the dense path hands it to the HF Gemma4 forward.
+
+    HF only uses it to choose the vision mask builder. Legacy Transformers (``create_causal_mask_mapping``)
+    requires it when training vision-bidirectional configs, so it defaults to all-text there. Current
+    Transformers get ``None`` for batches without vision tokens: the vision builder's sliding mask
+    (``AND(window, OR(causal, image blocks))``) then equals the plain one but hides the plain window from
+    attention backends (e.g. ffpa's ``"fa"`` sliding path).
+
+    Args:
+        mm_token_type_ids: Optional tensor of shape [batch, sequence] of multimodal token types, where 1 and 2
+            mark vision tokens.
+        reference: ``input_ids`` of shape [batch, sequence] or ``inputs_embeds`` of shape
+            [batch, sequence, hidden]; supplies the shape and device of the legacy default.
+        vision_bidirectional: Whether the config sets ``use_bidirectional_attention="vision"``.
+        training: Whether the model is in training mode.
+
+    Returns:
+        ``mm_token_type_ids`` unchanged, an all-zero tensor of shape [batch, sequence] (legacy default), or
+        ``None``.
+    """
+    from transformers.models.gemma4 import modeling_gemma4
+
+    if getattr(modeling_gemma4, "create_causal_mask_mapping", None) is not None:
+        if mm_token_type_ids is None and vision_bidirectional and training:
+            return torch.zeros(reference.shape[:2], dtype=torch.long, device=reference.device)
+        return mm_token_type_ids
+    if mm_token_type_ids is not None and not bool(((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).any()):
+        return None
+    return mm_token_type_ids
+
+
 def _build_unpacked_gemma4_causal_mask_mapping(
     config,
     inputs_embeds: torch.Tensor,
@@ -1343,13 +1381,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     audio_hidden_states=None,
                 )
 
-            if (
-                mm_token_type_ids is None
-                and getattr(text_config, "use_bidirectional_attention", None) == "vision"
-                and self.training
-            ):
-                ref = input_ids if input_ids is not None else inputs_embeds
-                mm_token_type_ids = torch.zeros(ref.shape[:2], dtype=torch.long, device=ref.device)
+            mm_token_type_ids = _dense_hf_mm_token_type_ids(
+                mm_token_type_ids,
+                input_ids if input_ids is not None else inputs_embeds,
+                vision_bidirectional=getattr(text_config, "use_bidirectional_attention", None) == "vision",
+                training=self.training,
+            )
 
             # E2B/E4B only: same cache-free kv-sharing holder as the CP path above,
             # so the trailing shared layers read their source K/V even when the HF

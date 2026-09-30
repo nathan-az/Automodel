@@ -297,7 +297,7 @@ def test_ffpa_mask_can_route_sliding_to_sdpa():
 
 
 def test_ffpa_mask_rejects_unknown_sliding_backend():
-    with pytest.raises(ValueError, match="ffpa_sliding_attn_backend must be 'flex' or 'sdpa', got 'invalid'"):
+    with pytest.raises(ValueError, match="ffpa_sliding_attn_backend must be 'flex', 'sdpa' or 'fa', got 'invalid'"):
         ffpa_mod.ffpa_mask(
             batch_size=1,
             q_length=4,
@@ -333,3 +333,205 @@ def test_block_mask_requires_flex_no_sdpa_fallback():
     ):
         ffpa_attention_forward(_module(256), q, k, v, attention_mask=object(), scaling=0.0625)
     mock_sdpa.assert_not_called()
+
+
+# --- ffpa_sliding_attn_backend="fa": FlashAttention-2 for sliding-window layers ---
+
+_FA_CONFIG = SimpleNamespace(ffpa_sliding_attn_backend="fa")
+
+
+def _plain_sliding_mask_kwargs(**overrides):
+    """Keyword arguments Transformers passes ffpa_mask for an unpacked, overlay-free sliding-window mask."""
+    from transformers.masking_utils import sliding_window_causal_mask_function
+
+    kwargs = dict(
+        batch_size=2,
+        q_length=4,
+        kv_length=4,
+        mask_function=sliding_window_causal_mask_function(2),
+        attention_mask=None,
+        dtype=torch.bfloat16,
+        config=_FA_CONFIG,
+        local_size=2,
+        allow_is_causal_skip=True,
+        device="cpu",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _sliding_module(head_dim, sliding_window, backend="fa"):
+    m = _module(head_dim)
+    m.sliding_window = sliding_window
+    m.config = SimpleNamespace(ffpa_sliding_attn_backend=backend)
+    return m
+
+
+def test_ffpa_mask_fa_skips_block_mask_for_plain_sliding_window(monkeypatch):
+    monkeypatch.setattr(ffpa_mod, "HAS_FLASH_ATTN", True)
+    padding = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]])
+    with mock.patch("transformers.masking_utils.flex_attention_mask") as mock_flex_mask:
+        unpadded = ffpa_mod.ffpa_mask(**_plain_sliding_mask_kwargs())
+        padded = ffpa_mod.ffpa_mask(**_plain_sliding_mask_kwargs(attention_mask=padding))
+    mock_flex_mask.assert_not_called()
+    assert unpadded is None
+    assert torch.equal(padded, padding.bool())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(allow_is_causal_skip=False),  # Transformers composed an overlay (vision, packing, custom fn)
+        dict(local_size=None),  # not a sliding-window mask
+        dict(q_length=1, q_offset=3),  # cache / decoding
+        dict(dtype=torch.float32),
+    ],
+    ids=["composed", "not_sliding", "decoding", "fp32"],
+)
+def test_ffpa_mask_fa_keeps_flex_block_mask_when_fa_cannot_own_the_mask(monkeypatch, overrides):
+    monkeypatch.setattr(ffpa_mod, "HAS_FLASH_ATTN", True)
+    sentinel = object()
+    with mock.patch("transformers.masking_utils.flex_attention_mask", return_value=sentinel) as mock_flex_mask:
+        out = ffpa_mod.ffpa_mask(**_plain_sliding_mask_kwargs(**overrides))
+    mock_flex_mask.assert_called_once()
+    assert out is sentinel
+
+
+def test_ffpa_mask_fa_keeps_flex_block_mask_without_flash_attn(monkeypatch, caplog):
+    monkeypatch.setattr(ffpa_mod, "HAS_FLASH_ATTN", False)
+    sentinel = object()
+    with (
+        caplog.at_level(logging.WARNING, logger=ffpa_mod.__name__),
+        mock.patch("transformers.masking_utils.flex_attention_mask", return_value=sentinel),
+    ):
+        out = ffpa_mod.ffpa_mask(**_plain_sliding_mask_kwargs())
+    assert out is sentinel
+    assert _warns(caplog, "flash_attn is not importable")
+
+
+def test_fa_route_calls_flash_attn_with_hf_sliding_window_semantics():
+    q, k, v = _qkv(1, 8, 4, 16, 256)
+    fa_out = torch.zeros(1, 16, 8, 256)
+    with (
+        mock.patch.object(ffpa_mod, "_flash_attn_func", return_value=fa_out) as mock_fa,
+        _patch_sdpa() as mock_sdpa,
+    ):
+        out, weights = ffpa_attention_forward(_sliding_module(256, 4), q, k, v, attention_mask=None, scaling=1.0)
+    mock_sdpa.assert_not_called()
+    assert out is fa_out and weights is None
+    fa_q, fa_k, _ = mock_fa.call_args.args
+    assert fa_q.shape == (1, 16, 8, 256) and fa_k.shape == (1, 16, 4, 256)  # [batch, sequence, heads, head_dim]
+    assert mock_fa.call_args.kwargs == dict(
+        dropout_p=0.0, softmax_scale=1.0, causal=True, window_size=(3, 0), softcap=0.0
+    )
+
+
+@pytest.mark.parametrize(
+    "module",
+    [_sliding_module(256, None), _sliding_module(256, 4, backend="flex")],
+    ids=["full_layer", "flex_backend"],
+)
+def test_fa_route_is_only_for_sliding_layers_with_fa_backend(module):
+    q, k, v = _qkv(1, 8, 4, 16, 256)
+    with mock.patch.object(ffpa_mod, "_flash_attn_func") as mock_fa, _patch_sdpa() as mock_sdpa:
+        ffpa_attention_forward(module, q, k, v, attention_mask=None, scaling=1.0)
+    mock_fa.assert_not_called()
+    mock_sdpa.assert_called_once()
+
+
+def test_fa_route_rejects_head_dim_above_flash_attn_limit():
+    q, k, v = _qkv(1, 8, 4, 16, 512)
+    with pytest.raises(RuntimeError, match="head_dim <= 256"):
+        ffpa_attention_forward(_sliding_module(512, 4), q, k, v, attention_mask=None, scaling=1.0)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and ffpa_mod.HAS_FLASH_ATTN), reason="requires CUDA and flash_attn")
+@pytest.mark.parametrize("padding_side", ["none", "right", "left"])
+def test_fa_sliding_matches_fp32_reference(padding_side):
+    batch, q_heads, kv_heads, seq, head_dim, window = 2, 4, 2, 96, 256, 16
+    padding = torch.ones(batch, seq, dtype=torch.long, device="cuda")
+    if padding_side == "right":
+        padding[1, -20:] = 0
+    elif padding_side == "left":
+        padding[1, :20] = 0
+    mask = ffpa_mod.ffpa_mask(
+        **_plain_sliding_mask_kwargs(
+            batch_size=batch,
+            q_length=seq,
+            kv_length=seq,
+            local_size=window,
+            attention_mask=padding if padding_side != "none" else None,
+            device="cuda",
+        )
+    )
+    assert (mask is None) is (padding_side == "none")
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q32 = torch.randn(batch, q_heads, seq, head_dim, device="cuda", generator=g)
+    k32 = torch.randn(batch, kv_heads, seq, head_dim, device="cuda", generator=g)
+    v32 = torch.randn(batch, kv_heads, seq, head_dim, device="cuda", generator=g)
+    grad_out = torch.randn(batch, seq, q_heads, head_dim, device="cuda", generator=g)
+    valid = padding.bool()
+
+    def run(q, k, v, attn):
+        """Run ``attn(q, k, v)`` and backprop ``grad_out`` over valid query rows.
+
+        Args:
+            q: Query tensor of shape [batch, query_heads, sequence, head_dim].
+            k: Key tensor of shape [batch, key_value_heads, sequence, head_dim].
+            v: Value tensor of shape [batch, key_value_heads, sequence, head_dim].
+            attn: Callable returning an output tensor of shape [batch, sequence, query_heads, head_dim].
+
+        Returns:
+            List of fp32 tensors: the output on valid rows of shape [valid_tokens, query_heads, head_dim], then
+            the query, key, and value gradients in their input shapes.
+        """
+        q, k, v = (t.detach().requires_grad_() for t in (q, k, v))
+        out = attn(q, k, v)
+        (out.float() * grad_out)[valid].sum().backward()
+        return [out.float()[valid], q.grad.float(), k.grad.float(), v.grad.float()]
+
+    def reference(q, k, v):
+        """fp32 math attention with HF sliding-window semantics (keep kv_idx in (q_idx - window, q_idx]).
+
+        Args:
+            q: Query tensor of shape [batch, query_heads, sequence, head_dim].
+            k: Key tensor of shape [batch, key_value_heads, sequence, head_dim].
+            v: Value tensor of shape [batch, key_value_heads, sequence, head_dim].
+
+        Returns:
+            Output tensor of shape [batch, sequence, query_heads, head_dim].
+        """
+        idx = torch.arange(seq, device="cuda")
+        keep = (idx[None, :] <= idx[:, None]) & (idx[None, :] > idx[:, None] - window)
+        keep = keep[None, None] & valid[:, None, None, :]
+        rep = q_heads // kv_heads
+        scores = q @ k.repeat_interleave(rep, 1).transpose(-1, -2)
+        probs = scores.masked_fill(~keep, float("-inf")).softmax(-1).nan_to_num()
+        return (probs @ v.repeat_interleave(rep, 1)).transpose(1, 2)
+
+    def bf16_sdpa(q, k, v):
+        """bf16 SDPA with the same explicit mask; its error vs fp32 is the bf16 noise floor.
+
+        Args:
+            q: Query tensor of shape [batch, query_heads, sequence, head_dim].
+            k: Key tensor of shape [batch, key_value_heads, sequence, head_dim].
+            v: Value tensor of shape [batch, key_value_heads, sequence, head_dim].
+
+        Returns:
+            Output tensor of shape [batch, sequence, query_heads, head_dim].
+        """
+        idx = torch.arange(seq, device="cuda")
+        keep = (idx[None, :] <= idx[:, None]) & (idx[None, :] > idx[:, None] - window)
+        keep = keep[None, None] & valid[:, None, None, :]
+        keep = keep | ~keep.any(-1, keepdim=True)  # fully padded query rows: any finite output (ignored)
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=keep, scale=1.0, enable_gqa=True)
+        return out.transpose(1, 2)
+
+    module = _sliding_module(head_dim, window)
+    expected = run(q32, k32, v32, reference)
+    bf16 = [t.bfloat16() for t in (q32, k32, v32)]
+    floor = run(*bf16, bf16_sdpa)
+    actual = run(*bf16, lambda q, k, v: ffpa_attention_forward(module, q, k, v, attention_mask=mask, scaling=1.0)[0])
+    for name, a, f, e in zip(["out", "dq", "dk", "dv"], actual, floor, expected):
+        rel, rel_floor = ((a - e).norm() / e.norm()).item(), ((f - e).norm() / e.norm()).item()
+        assert rel <= 1.5 * rel_floor + 1e-3, f"{name}: rel-L2 {rel:.4f} vs bf16 SDPA floor {rel_floor:.4f}"
