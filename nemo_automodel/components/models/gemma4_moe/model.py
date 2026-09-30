@@ -514,7 +514,8 @@ def _build_unpacked_gemma4_causal_mask_mapping(
         position_ids: Optional tensor of shape ``[batch, sequence]`` containing
             token positions.
         mm_token_type_ids: Optional tensor of shape ``[batch, sequence]``
-            containing multimodal token types.
+            containing multimodal token types. Only vision tokens (types 1 and 2)
+            add bidirectional edges; batches without any get plain causal masks.
         pixel_values: Optional tensor of shape
             ``[images, channels, height, width]`` containing image pixels. It is
             forwarded only to the legacy Gemma4 mask builder.
@@ -522,8 +523,8 @@ def _build_unpacked_gemma4_causal_mask_mapping(
 
     Returns:
         Mapping from ``full_attention`` and ``sliding_attention`` to tensors of
-        shape ``[batch, 1, query, key]`` or equivalent block masks produced by
-        the active Transformers implementation.
+        shape ``[batch, 1, query, key]``, equivalent block masks, or ``None``
+        when the active Transformers implementation needs no explicit mask.
     """
     from transformers.models.gemma4 import modeling_gemma4
 
@@ -542,9 +543,15 @@ def _build_unpacked_gemma4_causal_mask_mapping(
 
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-    block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
+    # The vision overlay only adds same-image edges, so without vision tokens it is a no-op on the
+    # mask values. Passing it anyway makes the mask function non-causal, which pushes backends off
+    # their causal fast path (e.g. attn_implementation="ffpa" routes full layers to Flex instead
+    # of FFPA). Drop it for text-only batches, matching HF's Gemma4Model.
+    block_sequence_ids = None
     if mm_token_type_ids is not None:
         block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
+        if not bool((block_sequence_ids >= 0).any()):
+            block_sequence_ids = None
     mask_kwargs = {
         "config": config,
         "inputs_embeds": inputs_embeds,

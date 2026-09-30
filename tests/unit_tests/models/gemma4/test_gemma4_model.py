@@ -19,7 +19,6 @@ import torch
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.parallelization import _get_attention_head_counts
 from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4ForConditionalGeneration,
     Gemma4Gate,
@@ -31,6 +30,7 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     _build_unpacked_gemma4_causal_mask_mapping,
     _derive_padding_mask,
 )
+from nemo_automodel.components.models.gemma4_moe.parallelization import _get_attention_head_counts
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 
@@ -560,6 +560,60 @@ class TestPackedGemma4MaskMapping:
         expected_block_ids = torch.tensor([[-1, 0, 0, -1]])
         torch.testing.assert_close(create_full.call_args.kwargs["block_sequence_ids"], expected_block_ids)
         torch.testing.assert_close(create_sliding.call_args.kwargs["block_sequence_ids"], expected_block_ids)
+
+    def test_unpacked_text_only_mask_matches_all_text_overlay(self, monkeypatch):
+        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+        from transformers.models.gemma4 import modeling_gemma4
+
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", None, raising=False)
+        config = _make_text_config(sliding_window=3)
+        config._attn_implementation = "sdpa"
+        inputs_embeds = torch.zeros(2, 6, 8)
+        attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1]])
+        mm_token_type_ids = torch.zeros(2, 6, dtype=torch.long)
+
+        actual = _build_unpacked_gemma4_causal_mask_mapping(
+            config, inputs_embeds, attention_mask, None, None, mm_token_type_ids, None, is_training=True
+        )
+
+        # An all-text (-1) overlay adds no edges, so dropping it must not change any mask value.
+        overlay_kwargs = dict(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=None,
+            block_sequence_ids=torch.full((2, 6), -1),
+        )
+        torch.testing.assert_close(actual["full_attention"], create_causal_mask(**overlay_kwargs))
+        torch.testing.assert_close(actual["sliding_attention"], create_sliding_window_causal_mask(**overlay_kwargs))
+
+    def test_unpacked_text_only_mask_lets_ffpa_take_full_layers(self, monkeypatch):
+        from transformers.models.gemma4 import modeling_gemma4
+
+        from nemo_automodel.components.attention.ffpa_attention import register_ffpa_attention
+
+        register_ffpa_attention()
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", None, raising=False)
+        # sdpa sliding masks keep this CPU test off the (slow-to-compile) Flex BlockMask builder.
+        config = _make_text_config(sliding_window=4, ffpa_sliding_attn_backend="sdpa")
+        config._attn_implementation = "ffpa"
+        inputs_embeds = torch.zeros(1, 16, 8)
+
+        text_only = _build_unpacked_gemma4_causal_mask_mapping(
+            config, inputs_embeds, None, None, None, torch.zeros(1, 16, dtype=torch.long), None, is_training=True
+        )
+        # ffpa only runs the FFPA kernel when the full-attention mask is None; any mask routes to a fallback.
+        assert text_only["full_attention"] is None
+        assert text_only["sliding_attention"].shape == (1, 1, 16, 16)
+
+        mm_token_type_ids = torch.zeros(1, 16, dtype=torch.long)
+        mm_token_type_ids[0, 4:8] = 1
+        with_image = _build_unpacked_gemma4_causal_mask_mapping(
+            config, inputs_embeds, None, None, None, mm_token_type_ids, None, is_training=True
+        )
+        # Batches with vision tokens are unchanged: the overlay is still applied, so the mask stays explicit.
+        assert with_image["full_attention"] is not None
 
 
 # ---------------------------------------------------------------------------
